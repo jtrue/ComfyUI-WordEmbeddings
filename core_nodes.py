@@ -1,13 +1,8 @@
-
-#️⃣ Updated **core code** (defaults to `glove-wiki-gigaword-50`)
-
-Replace your file contents with this version—only the defaults and model ordering logic changed:
-
-```python
 # ComfyUI-WordEmbeddings
-# Nodes: Loader (dropdown), Interpolator (STRING), Explorer (STRING)
+# Nodes: Loader (dropdown), Interpolator (STRING), Explorer (STRING), Equation (STRING)
 
 import math
+import re
 import numpy as np
 
 # ---------- gensim helpers ----------
@@ -16,21 +11,19 @@ def _lazy_api():
     return api
 
 def _list_gensim_models():
-    SMALL_DEFAULT = "glove-wiki-gigaword-50"
+    small_default = "glove-wiki-gigaword-50"
     try:
         api = _lazy_api()
         info = api.info()
         names = list(info.get("models", {}).keys())
         if not names:
-            return [SMALL_DEFAULT]
-        # Put the small default first if available
-        if SMALL_DEFAULT in names:
-            names.remove(SMALL_DEFAULT)
-            names.insert(0, SMALL_DEFAULT)
+            return [small_default]
+        if small_default in names:
+            names.remove(small_default)
+            names.insert(0, small_default)
         return names
     except Exception:
-        # Offline / error fallback
-        return [SMALL_DEFAULT]
+        return [small_default]
 
 _MODEL_CHOICES = _list_gensim_models()
 _MODEL_CACHE = {}
@@ -58,7 +51,8 @@ def _cos(u, v):
     return float((u @ v) / (nu * nv))
 
 def _slerp(a, b, t):
-    a = a / np.linalg.norm(a); b = b / np.linalg.norm(b)
+    a = a / np.linalg.norm(a)
+    b = b / np.linalg.norm(b)
     dot = float(np.clip(a @ b, -1.0, 1.0))
     if dot > 0.9995:
         v = (1 - t) * a + t * b
@@ -109,7 +103,6 @@ class WordEmbeddingsInterpolator:
                 "model_name": ("STRING", {"multiline": False, "default": "glove-wiki-gigaword-50"}),
                 "word_a": ("STRING", {"multiline": False, "default": "king"}),
                 "word_b": ("STRING", {"multiline": False, "default": "queen"}),
-                # stops = number of evenly spaced samples strictly between A and B
                 "stops": ("INT", {"default": 12, "min": 1, "max": 256}),
             },
             "optional": {
@@ -129,7 +122,6 @@ class WordEmbeddingsInterpolator:
         except Exception as e:
             return ("", f"[ComfyUI-WordEmbeddings] Error loading model '{model_name}': {e}")
 
-        # Get vectors (case-insensitive)
         try:
             A = _get_vec(model, word_a)
         except KeyError:
@@ -139,18 +131,14 @@ class WordEmbeddingsInterpolator:
         except KeyError:
             return ("", f"[ComfyUI-WordEmbeddings] Not in vocab: {word_b}")
 
-        # Evenly spaced t strictly between (0,1)
         ts = np.linspace(1.0 / (stops + 1), 1.0 - 1.0 / (stops + 1), stops)
-
         seen = {word_a, word_b, word_a.lower(), word_b.lower()}
         words = []
         debug_lines = []
 
-        # Precompute for diagnostics
         mid = (A + B) / 2
         cos_AB = _cos(A, B)
 
-        # --- Endpoint A (t=0.000) ---
         cos_vword_A = 1.000
         cosA_A = 1.000
         cosB_A = cos_AB
@@ -159,7 +147,6 @@ class WordEmbeddingsInterpolator:
             f"00 t=0.000 word={word_a}  cos(v,word)={cos_vword_A:.3f}  cosA={cosA_A:.3f}  cosB={cosB_A:.3f}  centr={centr_A:.3f}  (endpoint)"
         )
 
-        # --- Interior samples ---
         for i, t in enumerate(ts, 1):
             v = _slerp(A, B, float(t)) if method == "slerp" else ((1 - t) * A + t * B)
             pick = _nearest_to(v, model, topn=topn, seen=seen)
@@ -177,7 +164,6 @@ class WordEmbeddingsInterpolator:
                 f"{i:02d} t={t:.3f} word={w}  cos(v,word)={sim_v:.3f}  cosA={cA:.3f}  cosB={cB:.3f}  centr={cent:.3f}"
             )
 
-        # --- Endpoint B (t=1.000) ---
         idx_B = len(ts) + 1
         cos_vword_B = 1.000
         cosA_B = cos_AB
@@ -187,7 +173,6 @@ class WordEmbeddingsInterpolator:
             f"{idx_B:02d} t=1.000 word={word_b}  cos(v,word)={cos_vword_B:.3f}  cosA={cosA_B:.3f}  cosB={cosB_B:.3f}  centr={centr_B:.3f}  (endpoint)"
         )
 
-        # Output: samples only (no endpoints) + full debug trace with endpoints
         words_csv = ",".join(words)
         debug_txt = "\n".join(debug_lines) if debug_lines else "(no samples)"
         return (words_csv, debug_txt)
@@ -227,11 +212,8 @@ class WordEmbeddingsEquation:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "model_name": ("STRING", {"default": "glove-wiki-gigaword-50"}),  # small & fast default
-                "expression": ("STRING", {
-                    "default": "king - man + woman",
-                    "multiline": False
-                }),
+                "model_name": ("STRING", {"default": "glove-wiki-gigaword-50"}),
+                "expression": ("STRING", {"default": "king - man + woman", "multiline": False}),
                 "k": ("INT", {"default": 10, "min": 1, "max": 100}),
             },
             "optional": {
@@ -246,41 +228,23 @@ class WordEmbeddingsEquation:
     FUNCTION = "run"
     CATEGORY = "ComfyUI-WordEmbeddings"
 
-    # ----------------- parsing & math helpers -----------------
-
     def _norm(self, v):
         n = np.linalg.norm(v)
         return v / n if n > 0 else v
 
     def _parse_expression(self, expr: str):
-        """
-        Returns: list of (word, weight), list_of_skipped_tokens
-        Supports:
-          +, -, 'plus', 'minus'
-          '2*word' (any float coefficient)
-          number + word: e.g. '2.5', 'word'
-          ignores '=', 'equals', '->', '?' and anything after '='
-        """
         if not expr:
             return [], []
-
-        # cut off anything after '=' or 'equals'
         cut = re.split(r"(?:=|equals)", expr, flags=re.IGNORECASE)
         expr = cut[0]
-
-        # normalize separators
         s = expr.replace(",", " ").replace("\t", " ").strip()
-
         tokens = [t for t in re.split(r"\s+", s) if t]
         sign = +1.0
         pairs = []
         skipped = []
-
         i = 0
         while i < len(tokens):
             tok = tokens[i]
-
-            # operators
             if tok in {"+", "plus"}:
                 sign = +1.0
                 i += 1
@@ -289,61 +253,33 @@ class WordEmbeddingsEquation:
                 sign = -1.0
                 i += 1
                 continue
-
-            # coefficient formats: "2*word" or "2.5*word"
             m = re.match(r"^([+-]?\d+(?:\.\d+)?)\*(.+)$", tok)
             if m:
-                coef = float(m.group(1))
-                word = m.group(2)
-                pairs.append((word, sign * coef))
-                sign = +1.0
-                i += 1
-                continue
-
-            # number followed by word: "2.0", "word"
+                coef = float(m.group(1)); word = m.group(2)
+                pairs.append((word, sign * coef)); sign = +1.0; i += 1; continue
             mnum = re.match(r"^[+-]?\d+(?:\.\d+)?$", tok)
             if mnum and i + 1 < len(tokens):
                 try:
-                    coef = float(tok)
-                    word = tokens[i + 1]
-                    pairs.append((word, sign * coef))
-                    sign = +1.0
-                    i += 2
-                    continue
+                    coef = float(tok); word = tokens[i + 1]
+                    pairs.append((word, sign * coef)); sign = +1.0; i += 2; continue
                 except Exception:
                     pass
-
-            # ignore punctuation tokens like '?', '->'
             if tok in {"?", "->", "=>"}:
-                i += 1
-                continue
-
-            # plain word
-            pairs.append((tok, sign * 1.0))
-            sign = +1.0
-            i += 1
-
+                i += 1; continue
+            pairs.append((tok, sign * 1.0)); sign = +1.0; i += 1
         return pairs, skipped
 
-    # ----------------- main -----------------
-
     def run(self, model_name, expression, k, topn_pool=2000, normalize_terms=True, allow_inputs=False):
-        # 1) model
         try:
             model = get_model(model_name)
         except Exception as e:
-            return ("", f"[EquationNode] Error loading model '{model_name}': {e}")
-
-        # 2) parse
+            return ("", f"[ComfyUI-WordEmbeddings] Error loading model '{model_name}': {e}")
         pairs, skipped = self._parse_expression(expression)
         if not pairs:
             return ("", f"[ComfyUI-WordEmbeddings] Empty or unparsable expression: '{expression}'")
-
-        # 3) build vector
-        used = []     # (word, weight) actually used
-        missing = []  # words not in vocab
+        used = []
+        missing = []
         vec = None
-
         for word, w in pairs:
             try:
                 v = _get_vec(model, word)
@@ -354,19 +290,14 @@ class WordEmbeddingsEquation:
                 used.append((word, w))
             except KeyError:
                 missing.append(word)
-
         if vec is None:
-            return ("", f"[ComfyUI-WordEmbeddings] No valid words found in vocab. Missing: {', '.join(missing) if missing else '(none)'}")
-
+            miss = ", ".join(missing) if missing else "(none)"
+            return ("", f"[ComfyUI-WordEmbeddings] No valid words found in vocab. Missing: {miss}")
         target = self._norm(vec)
-
-        # 4) candidate search
         try:
             cand = model.similar_by_vector(target, topn=int(topn_pool))
         except Exception as e:
             return ("", f"[ComfyUI-WordEmbeddings] Search error: {e}")
-
-        # exclude inputs unless allowed
         input_words = {w for (w, _) in used}
         out = []
         for cw, approx_cos in cand:
@@ -380,7 +311,6 @@ class WordEmbeddingsEquation:
             out.append((cw, float(approx_cos), cos_t))
             if len(out) >= int(k):
                 break
-
         if not out:
             dbg = [
                 "[ComfyUI-WordEmbeddings] No results after filtering.",
@@ -390,7 +320,6 @@ class WordEmbeddingsEquation:
                 f"allow_inputs={allow_inputs}  topn_pool={topn_pool}  normalize_terms={normalize_terms}",
             ]
             return ("", "\n".join(dbg))
-
         words_csv = ",".join([w for (w, _, __) in out])
         debug_lines = [
             f"expr={expression}",
@@ -401,7 +330,6 @@ class WordEmbeddingsEquation:
         for i, (w2, ac, ct) in enumerate(out, 1):
             debug_lines.append(f"{i:02d} {w2}  approx_cos(target,cand)={ac:.3f}  cos(target,cand)={ct:.3f}")
         return (words_csv, "\n".join(debug_lines))
-
 
 # ---------- Registration ----------
 NODE_CLASS_MAPPINGS = {
