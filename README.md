@@ -179,12 +179,6 @@ Feel free to tailor axes to your domain—adding 3–10 good synonyms per side u
 
 ---
 
-## License
-
-MIT (or align with your repository’s license).
-
----
-
 ## Acknowledgements
 
 - Built on top of **Gensim**: https://radimrehurek.com/gensim/
